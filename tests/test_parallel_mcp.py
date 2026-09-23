@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import socket
 import threading
 import time
 import unittest
@@ -36,6 +38,29 @@ class _MCPHandler(BaseHTTPRequestHandler):
             self.send_header("Mcp-Session-Id", session_id or _SESSION_ID)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_slow_trickled_json_headers(self, message):
+        body = json.dumps(message, separators=(",", ":")).encode()
+        headers = [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: application/json\r\n",
+            f"Content-Length: {len(body)}\r\n".encode(),
+            f"Mcp-Session-Id: {_SESSION_ID}\r\n".encode(),
+        ]
+        headers.extend(
+            f"X-Trickle-{index}: fixture\r\n".encode()
+            for index in range(12)
+        )
+        headers.append(b"\r\n")
+
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            for header in headers:
+                self.connection.sendall(header)
+                time.sleep(0.1)
+            self.connection.sendall(body)
+        except OSError:
+            pass
 
     def _send_chunked_sse(self, body):
         self.send_response(200)
@@ -75,7 +100,7 @@ class _MCPHandler(BaseHTTPRequestHandler):
                 if self.server.initialize_count:
                     session_id = _RENEWED_SESSION_ID
                 self.server.initialize_count += 1
-            self._send_json({
+            message = {
                 "jsonrpc": "2.0",
                 "id": payload["id"],
                 "result": {
@@ -83,7 +108,11 @@ class _MCPHandler(BaseHTTPRequestHandler):
                     "capabilities": {},
                     "serverInfo": {"name": "fixture", "version": "1"},
                 },
-            }, add_session=True, session_id=session_id)
+            }
+            if self.server.mode == "slow_headers":
+                self._send_slow_trickled_json_headers(message)
+            else:
+                self._send_json(message, add_session=True, session_id=session_id)
             return
 
         if method == "notifications/initialized":
@@ -215,6 +244,56 @@ class ParallelMCPTests(unittest.TestCase):
             for request in requests
         ))
 
+    def test_search_web_from_running_event_loop(self):
+        async def search():
+            return tool_store.search_web("fixture query", 1)
+
+        with patch.dict(os.environ, {"SEARCH_BACKEND": "parallel"}):
+            with patch.dict(
+                tool_store._SEARCH_BACKENDS,
+                {"parallel": (tool_store._search_parallel, [])},
+            ):
+                result = asyncio.run(search())
+
+        self.assertIn("Fixture result", result)
+        self.assertFalse(any(
+            thread.name.startswith("trajectorykit-parallel-mcp")
+            for thread in threading.enumerate()
+        ))
+        self.assertTrue(any(
+            request["rpc_method"] == "tools/call" for request in self.server.requests
+        ))
+
+    def test_slow_trickled_headers_respect_deadline_before_fallback(self):
+        self.server.mode = "slow_headers"
+        fallback_calls = []
+        timeout = 0.35
+
+        def timed_parallel_search(query, num_results):
+            return parallel_mcp.search_parallel(query, num_results, timeout)
+
+        def exa_fallback(_query, _num_results):
+            fallback_calls.append("exa")
+            return "fallback result"
+
+        started = time.monotonic()
+        with patch.dict(os.environ, {"SEARCH_BACKEND": "parallel"}):
+            with patch.dict(
+                tool_store._SEARCH_BACKENDS,
+                {"parallel": (timed_parallel_search, [exa_fallback])},
+            ):
+                result = tool_store.search_web("fixture query", 1)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result, "fallback result")
+        self.assertEqual(fallback_calls, ["exa"])
+        self.assertGreaterEqual(elapsed, timeout * 0.7)
+        self.assertLess(elapsed, timeout + 0.6)
+        self.assertEqual(
+            [request["rpc_method"] for request in self.server.requests],
+            ["initialize"],
+        )
+
     def test_streamed_sse_response_without_content_length_is_bounded(self):
         self.server.mode = "oversized"
         with patch.object(parallel_mcp, "_MCP_MAX_RESPONSE_BYTES", 512):
@@ -232,12 +311,16 @@ class ParallelMCPTests(unittest.TestCase):
 
     def test_expired_session_reinitializes_and_cleans_up_only_renewed_session(self):
         self.server.mode = "expired_call"
+
+        async def search():
+            return tool_store.search_web("fixture query", 1)
+
         with patch.dict(os.environ, {"SEARCH_BACKEND": "parallel"}):
             with patch.dict(
                 tool_store._SEARCH_BACKENDS,
                 {"parallel": (tool_store._search_parallel, [])},
             ):
-                result = tool_store.search_web("fixture query", 1)
+                result = asyncio.run(search())
 
         self.assertIn("Fixture result", result)
         posts = [

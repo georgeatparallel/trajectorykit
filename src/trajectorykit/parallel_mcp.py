@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import httpx
 
 from . import __version__
 
@@ -58,7 +60,7 @@ def _decode_json_rpc_message(body: bytes) -> Dict[str, Any]:
     return message
 
 
-def _check_response_size(response: requests.Response) -> None:
+def _check_response_size(response: httpx.Response) -> None:
     content_length = response.headers.get("Content-Length")
     if content_length is not None:
         try:
@@ -68,12 +70,12 @@ def _check_response_size(response: requests.Response) -> None:
             pass
 
 
-def _read_json_response(
-    response: requests.Response, request_id: int, deadline: float
+async def _read_json_response(
+    response: httpx.Response, request_id: int, deadline: float
 ) -> Dict[str, Any]:
     body = bytearray()
     _check_response_size(response)
-    for chunk in response.iter_content(chunk_size=8192):
+    async for chunk in response.aiter_bytes(chunk_size=8192):
         if time.monotonic() >= deadline:
             raise _ParallelMCPError("request timed out")
         if not chunk:
@@ -83,20 +85,22 @@ def _read_json_response(
             raise _ParallelMCPError("response exceeded the size limit")
 
     message = _decode_json_rpc_message(bytes(body))
+    if time.monotonic() >= deadline:
+        raise _ParallelMCPError("request timed out")
     if message.get("id") != request_id:
         raise _ParallelMCPError("returned a mismatched response ID")
     return message
 
 
-def _read_sse_response(
-    response: requests.Response, request_id: int, deadline: float
+async def _read_sse_response(
+    response: httpx.Response, request_id: int, deadline: float
 ) -> Dict[str, Any]:
     pending = bytearray()
     data_lines: List[bytes] = []
     total_size = 0
     _check_response_size(response)
 
-    for chunk in response.iter_content(chunk_size=4096):
+    async for chunk in response.aiter_bytes(chunk_size=4096):
         if time.monotonic() >= deadline:
             raise _ParallelMCPError("request timed out")
         if not chunk:
@@ -119,6 +123,8 @@ def _read_sse_response(
                 if data_lines:
                     message = _decode_json_rpc_message(b"\n".join(data_lines))
                     data_lines = []
+                    if time.monotonic() >= deadline:
+                        raise _ParallelMCPError("request timed out")
                     if message.get("id") == request_id:
                         return message
                 continue
@@ -134,8 +140,17 @@ def _read_sse_response(
     raise _ParallelMCPError("did not receive a matching SSE response")
 
 
-def _post_mcp_request(
-    session: requests.Session,
+def _request_timeout(remaining: float) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=min(_MCP_CONNECT_TIMEOUT, remaining),
+        read=min(_MCP_IO_TIMEOUT, remaining),
+        write=min(_MCP_IO_TIMEOUT, remaining),
+        pool=min(_MCP_CONNECT_TIMEOUT, remaining),
+    )
+
+
+async def _post_mcp_request(
+    session: httpx.AsyncClient,
     payload: Dict[str, Any],
     request_id: Optional[int],
     session_id: Optional[str],
@@ -146,64 +161,70 @@ def _post_mcp_request(
     if remaining <= 0:
         raise _ParallelMCPError("request timed out")
 
-    response = session.post(
-        _MCP_ENDPOINT,
-        json=payload,
-        headers=_request_headers(session_id, protocol_version),
-        timeout=(min(_MCP_CONNECT_TIMEOUT, remaining), min(_MCP_IO_TIMEOUT, remaining)),
-        stream=True,
-        allow_redirects=False,
-    )
+    async def send_request() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        async with session.stream(
+            "POST",
+            _MCP_ENDPOINT,
+            json=payload,
+            headers=_request_headers(session_id, protocol_version),
+            timeout=_request_timeout(remaining),
+            follow_redirects=False,
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                if 300 <= response.status_code < 400:
+                    raise _ParallelMCPError("redirects are not followed")
+                if response.status_code == 404 and session_id:
+                    raise _ExpiredMCPSession("returned HTTP 404")
+                raise _ParallelMCPError(f"returned HTTP {response.status_code}")
+
+            response_session_id = response.headers.get("Mcp-Session-Id") or session_id
+            if request_id is None:
+                return None, response_session_id
+
+            content_type = response.headers.get("Content-Type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type == "application/json":
+                message = await _read_json_response(response, request_id, deadline)
+            elif media_type == "text/event-stream":
+                message = await _read_sse_response(response, request_id, deadline)
+            else:
+                raise _ParallelMCPError("returned an unsupported content type")
+            return message, response_session_id
+
     try:
-        if response.status_code < 200 or response.status_code >= 300:
-            if 300 <= response.status_code < 400:
-                raise _ParallelMCPError("redirects are not followed")
-            if response.status_code == 404 and session_id:
-                raise _ExpiredMCPSession("returned HTTP 404")
-            raise _ParallelMCPError(f"returned HTTP {response.status_code}")
-
-        response_session_id = response.headers.get("Mcp-Session-Id") or session_id
-        if request_id is None:
-            return None, response_session_id
-
-        content_type = response.headers.get("Content-Type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type == "application/json":
-            message = _read_json_response(response, request_id, deadline)
-        elif media_type == "text/event-stream":
-            message = _read_sse_response(response, request_id, deadline)
-        else:
-            raise _ParallelMCPError("returned an unsupported content type")
-        return message, response_session_id
-    finally:
-        try:
-            response.close()
-        except Exception:
-            pass
+        result = await asyncio.wait_for(send_request(), timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise _ParallelMCPError("request timed out") from exc
+    if time.monotonic() >= deadline:
+        raise _ParallelMCPError("request timed out")
+    return result
 
 
-def _cleanup_mcp_session(
-    session: requests.Session,
+async def _cleanup_mcp_session(
+    session: httpx.AsyncClient,
     session_id: str,
     protocol_version: Optional[str],
+    deadline: float,
 ) -> None:
-    response = None
-    try:
-        response = session.delete(
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    cleanup_timeout = min(2, remaining)
+
+    async def delete_session() -> None:
+        async with session.stream(
+            "DELETE",
             _MCP_ENDPOINT,
             headers=_request_headers(session_id, protocol_version),
-            timeout=2,
-            stream=True,
-            allow_redirects=False,
-        )
+            timeout=_request_timeout(cleanup_timeout),
+            follow_redirects=False,
+        ):
+            pass
+
+    try:
+        await asyncio.wait_for(delete_session(), timeout=cleanup_timeout)
     except Exception as exc:
         logger.debug("Parallel Search MCP session cleanup failed: %s", type(exc).__name__)
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
 
 
 def _search_results_payload(tool_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -224,16 +245,20 @@ def _search_results_payload(tool_result: Dict[str, Any]) -> Dict[str, Any]:
     return structured
 
 
-def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
+async def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
     session = None
     session_id = None
     protocol_version = None
     request_number = 0
 
     try:
-        session = requests.Session()
+        session = httpx.AsyncClient()
 
-        def request(method: str, params: Optional[Dict[str, Any]] = None, notification: bool = False):
+        async def request(
+            method: str,
+            params: Optional[Dict[str, Any]] = None,
+            notification: bool = False,
+        ):
             nonlocal protocol_version, request_number, session_id
             request_number += 1
             request_id = None if notification else request_number
@@ -243,7 +268,7 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
             if request_id is not None:
                 payload["id"] = request_id
 
-            message, response_session_id = _post_mcp_request(
+            message, response_session_id = await _post_mcp_request(
                 session,
                 payload,
                 request_id,
@@ -265,7 +290,7 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
                 raise _ParallelMCPError("returned an invalid JSON-RPC result")
             return result
 
-        initialized = request(
+        initialized = await request(
             "initialize",
             {
                 "protocolVersion": _MCP_PROTOCOL_VERSION,
@@ -278,14 +303,14 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
             raise _ParallelMCPError("negotiated an unsupported protocol version")
         protocol_version = negotiated_version
 
-        request("notifications/initialized", notification=True)
+        await request("notifications/initialized", notification=True)
 
         cursor = None
         seen_cursors = set()
         web_search_found = False
         for _ in range(_MCP_MAX_DISCOVERY_PAGES):
             params = {"cursor": cursor} if cursor else {}
-            page = request("tools/list", params)
+            page = await request("tools/list", params)
             tools = page.get("tools")
             if not isinstance(tools, list):
                 raise _ParallelMCPError("returned an invalid tool list")
@@ -304,7 +329,7 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
         if not web_search_found:
             raise _ParallelMCPError("does not expose the web_search tool")
 
-        tool_result = request(
+        tool_result = await request(
             "tools/call",
             {
                 "name": "web_search",
@@ -316,6 +341,8 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
 
         results = _search_results_payload(tool_result).get("results", [])
         if not results:
+            if time.monotonic() >= deadline:
+                raise _ParallelMCPError("request timed out")
             return f"No results found for query: {q}"
 
         formatted = []
@@ -340,6 +367,8 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
 
         if not formatted:
             raise _ParallelMCPError("returned no usable search results")
+        if time.monotonic() >= deadline:
+            raise _ParallelMCPError("request timed out")
         return f"Search Results for '{q}':\n\n" + "\n\n".join(formatted) + "\n\n"
 
     except _ExpiredMCPSession:
@@ -348,23 +377,47 @@ def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
     finally:
         if session is not None:
             if session_id:
-                _cleanup_mcp_session(session, session_id, protocol_version)
+                await _cleanup_mcp_session(
+                    session, session_id, protocol_version, deadline
+                )
             try:
-                session.close()
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.wait_for(session.aclose(), timeout=remaining)
             except Exception:
                 pass
+
+
+def _run_search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_search_parallel_attempt(q, num_results, deadline))
+
+    def run_attempt() -> str:
+        return asyncio.run(_search_parallel_attempt(q, num_results, deadline))
+
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="trajectorykit-parallel-mcp"
+    ) as executor:
+        future = executor.submit(run_attempt)
+        remaining = max(0, deadline - time.monotonic())
+        try:
+            return future.result(timeout=remaining)
+        except FutureTimeoutError:
+            return future.result()
 
 
 def search_parallel(q: str, num_results: int, timeout: float) -> str:
     deadline = time.monotonic() + timeout
     try:
         try:
-            return _search_parallel_attempt(q, num_results, deadline)
+            return _run_search_parallel_attempt(q, num_results, deadline)
         except _ExpiredMCPSession:
-            return _search_parallel_attempt(q, num_results, deadline)
-    except requests.exceptions.Timeout:
+            return _run_search_parallel_attempt(q, num_results, deadline)
+    except httpx.TimeoutException:
         return "Search error: Parallel Search MCP request timed out."
-    except requests.exceptions.RequestException:
+    except httpx.RequestError:
         return "Search error: Could not connect to Parallel Search MCP."
     except _ParallelMCPError as exc:
         return f"Search error: Parallel Search MCP {exc}."
