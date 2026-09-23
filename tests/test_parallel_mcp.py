@@ -10,6 +10,7 @@ from trajectorykit import parallel_mcp, tool_store
 
 
 _SESSION_ID = "fixture-session"
+_RENEWED_SESSION_ID = "renewed-fixture-session"
 
 
 class _MCPHandler(BaseHTTPRequestHandler):
@@ -26,13 +27,13 @@ class _MCPHandler(BaseHTTPRequestHandler):
             "payload": payload,
         })
 
-    def _send_json(self, message, add_session=False):
+    def _send_json(self, message, add_session=False, session_id=None):
         body = json.dumps(message, separators=(",", ":")).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         if add_session:
-            self.send_header("Mcp-Session-Id", _SESSION_ID)
+            self.send_header("Mcp-Session-Id", session_id or _SESSION_ID)
         self.end_headers()
         self.wfile.write(body)
 
@@ -64,15 +65,25 @@ class _MCPHandler(BaseHTTPRequestHandler):
 
         method = payload.get("method")
         if method == "initialize":
+            session_id = _SESSION_ID
+            protocol_version = (
+                "2025-06-18"
+                if self.server.mode == "expired_call"
+                else "2025-11-25"
+            )
+            if self.server.mode == "expired_call":
+                if self.server.initialize_count:
+                    session_id = _RENEWED_SESSION_ID
+                self.server.initialize_count += 1
             self._send_json({
                 "jsonrpc": "2.0",
                 "id": payload["id"],
                 "result": {
-                    "protocolVersion": "2025-11-25",
+                    "protocolVersion": protocol_version,
                     "capabilities": {},
                     "serverInfo": {"name": "fixture", "version": "1"},
                 },
-            }, add_session=True)
+            }, add_session=True, session_id=session_id)
             return
 
         if method == "notifications/initialized":
@@ -90,6 +101,14 @@ class _MCPHandler(BaseHTTPRequestHandler):
             return
 
         if method == "tools/call":
+            if (
+                self.server.mode == "expired_call"
+                and self.headers.get("Mcp-Session-Id") == _SESSION_ID
+            ):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.server.mode == "slow":
                 time.sleep(5.25)
             if self.server.mode == "oversized":
@@ -136,6 +155,7 @@ class _MCPFixtureServer(ThreadingHTTPServer):
         self.daemon_threads = True
         self.mode = "normal"
         self.requests = []
+        self.initialize_count = 0
 
 
 class ParallelMCPTests(unittest.TestCase):
@@ -209,6 +229,76 @@ class ParallelMCPTests(unittest.TestCase):
         self.assertTrue(any(
             request["rpc_method"] == "tools/call" for request in self.server.requests
         ))
+
+    def test_expired_session_reinitializes_and_cleans_up_only_renewed_session(self):
+        self.server.mode = "expired_call"
+        with patch.dict(os.environ, {"SEARCH_BACKEND": "parallel"}):
+            with patch.dict(
+                tool_store._SEARCH_BACKENDS,
+                {"parallel": (tool_store._search_parallel, [])},
+            ):
+                result = tool_store.search_web("fixture query", 1)
+
+        self.assertIn("Fixture result", result)
+        posts = [
+            request
+            for request in self.server.requests
+            if request["http_method"] == "POST"
+        ]
+        self.assertEqual(
+            [request["rpc_method"] for request in posts],
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+            ],
+        )
+        self.assertNotIn("mcp-session-id", posts[0]["headers"])
+        self.assertNotIn("mcp-session-id", posts[4]["headers"])
+        self.assertNotIn("mcp-protocol-version", posts[4]["headers"])
+        self.assertEqual(
+            [request["headers"].get("mcp-protocol-version") for request in posts[1:4]],
+            ["2025-06-18"] * 3,
+        )
+        self.assertEqual(
+            [request["headers"].get("mcp-protocol-version") for request in posts[5:8]],
+            ["2025-06-18"] * 3,
+        )
+        self.assertEqual(
+            [
+                request["headers"].get("mcp-session-id")
+                for request in posts
+                if request["rpc_method"] != "initialize"
+            ],
+            [
+                _SESSION_ID,
+                _SESSION_ID,
+                _SESSION_ID,
+                _RENEWED_SESSION_ID,
+                _RENEWED_SESSION_ID,
+                _RENEWED_SESSION_ID,
+            ],
+        )
+        self.assertTrue(all(
+            request["headers"]["user-agent"]
+            == f"trajectorykit/{parallel_mcp.__version__}"
+            for request in self.server.requests
+        ))
+        cleanup_requests = [
+            request
+            for request in self.server.requests
+            if request["http_method"] == "DELETE"
+        ]
+        self.assertEqual(len(cleanup_requests), 1)
+        self.assertEqual(
+            cleanup_requests[0]["headers"].get("mcp-session-id"),
+            _RENEWED_SESSION_ID,
+        )
 
     def test_parallel_http_refusal_uses_configured_fallback(self):
         self.server.mode = "forbidden"

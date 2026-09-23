@@ -29,6 +29,10 @@ class _ParallelMCPError(Exception):
     pass
 
 
+class _ExpiredMCPSession(_ParallelMCPError):
+    pass
+
+
 def _request_headers(
     session_id: Optional[str], protocol_version: Optional[str]
 ) -> Dict[str, str]:
@@ -154,6 +158,8 @@ def _post_mcp_request(
         if response.status_code < 200 or response.status_code >= 300:
             if 300 <= response.status_code < 400:
                 raise _ParallelMCPError("redirects are not followed")
+            if response.status_code == 404 and session_id:
+                raise _ExpiredMCPSession("returned HTTP 404")
             raise _ParallelMCPError(f"returned HTTP {response.status_code}")
 
         response_session_id = response.headers.get("Mcp-Session-Id") or session_id
@@ -218,11 +224,10 @@ def _search_results_payload(tool_result: Dict[str, Any]) -> Dict[str, Any]:
     return structured
 
 
-def search_parallel(q: str, num_results: int, timeout: float) -> str:
+def _search_parallel_attempt(q: str, num_results: int, deadline: float) -> str:
     session = None
     session_id = None
     protocol_version = None
-    deadline = time.monotonic() + timeout
     request_number = 0
 
     try:
@@ -337,6 +342,26 @@ def search_parallel(q: str, num_results: int, timeout: float) -> str:
             raise _ParallelMCPError("returned no usable search results")
         return f"Search Results for '{q}':\n\n" + "\n\n".join(formatted) + "\n\n"
 
+    except _ExpiredMCPSession:
+        session_id = None
+        raise
+    finally:
+        if session is not None:
+            if session_id:
+                _cleanup_mcp_session(session, session_id, protocol_version)
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def search_parallel(q: str, num_results: int, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    try:
+        try:
+            return _search_parallel_attempt(q, num_results, deadline)
+        except _ExpiredMCPSession:
+            return _search_parallel_attempt(q, num_results, deadline)
     except requests.exceptions.Timeout:
         return "Search error: Parallel Search MCP request timed out."
     except requests.exceptions.RequestException:
@@ -346,11 +371,3 @@ def search_parallel(q: str, num_results: int, timeout: float) -> str:
     except Exception as exc:
         logger.warning("Parallel Search MCP failed: %s", type(exc).__name__)
         return "Search error: Parallel Search MCP response could not be processed."
-    finally:
-        if session is not None:
-            if session_id:
-                _cleanup_mcp_session(session, session_id, protocol_version)
-            try:
-                session.close()
-            except Exception:
-                pass
