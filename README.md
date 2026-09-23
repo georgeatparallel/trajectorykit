@@ -173,7 +173,7 @@ flowchart TD
 | Verification | Five-stage pipeline (rubric generation + 4-stage verification): First, create a rubric defining sub-questions, coverage checklist, source requirements, hallucination traps, and insight bar. Then after publishing: format gate → Stage 1 quality audit (8 criteria: adequacy, language consistency, depth, comprehensiveness, section quality, citations, coherence, conflicts/gaps) → Stage 2 spot-check (extract claims with external model, verify with local sub-agents in parallel, compare with local judge) → Stage 3 citation audit (verify URLs support claims). Fail paths loop back with rubric feedback. |
 | Cycle prevention | Five safety gates prevent infinite loops: can't publish without a draft, can't republish without revising, can't draft without researching, must follow the plan once it's active, and in report mode can't publish without a second research phase after the first draft. |
 | Context management | When the conversation gets long, we automatically trim old messages but keep the system prompt and recent turns. Tool outputs get stashed in an external `MemoryStore`, and synthesis sub-agents can query them by running code. No context is ever wasted. |
-| Search resilience | Three-tier fallback for search: try Serper first, then Exa.ai if Serper fails (better for neural queries), then DuckDuckGo as the last resort. Each tier handles credit exhaustion, auth failures, and rate limits gracefully. |
+| Search resilience | The default search chain is Serper → Exa.ai → DuckDuckGo. Set `SEARCH_BACKEND=parallel` to opt into Parallel Search MCP, with the existing providers as fallbacks. |
 | Fetch resilience | Four-tier fallback for fetching URLs: direct HTTP, then Jina Reader for JS-heavy sites, then Exa's content API, then Wayback Machine for archived versions. |
 | Draft workflow | The root agent writes drafts using the `refine_draft` tool and publishes via `research_complete`. We keep all draft versions, and the verifier gives feedback if your answer lacks depth or insight. |
 | Budget management | As you approach the turn limit, we send informal warnings at 5, 3, 2, and 1 turns remaining. On the final turn, the agent can only use `final_answer` to wrap things up. |
@@ -461,7 +461,7 @@ Sub-agents have access to these tools for research and fact-checking:
 
 | Tool | What it does |
 |------|-------------|
-| `search_web` | Search the web with automatic fallback: Serper → Exa.ai → DuckDuckGo. Handles credit exhaustion gracefully. |
+| `search_web` | Search the web with Serper → Exa.ai → DuckDuckGo by default. Set `SEARCH_BACKEND=parallel` to select the keyless Parallel Search MCP with automatic fallbacks. |
 | `fetch_url` | Fetch a page with four-tier resilience: direct HTTP → Jina Reader → Exa contents → Wayback Machine. Supports `css_selector` for targeted extraction and `extract="table"` mode for structured data. |
 | `read_page` | Scroll through cached page text from a previous `fetch_url` call — no new network requests. |
 | `extract_tables` | Parse HTML tables from a URL and return them as structured JSON (array of dictionaries). |
@@ -552,13 +552,16 @@ You need to set a few API keys depending on which features you're using:
 
 | Variable | What it's for |
 |----------|---------|
-| `SERPER_API_KEY` | Primary web search provider (Serper.dev). Falls back to Exa or DuckDuckGo if not set or credits run out. |
+| `SERPER_API_KEY` | Default web search provider (Serper.dev). Falls back to Exa or DuckDuckGo if not set or credits run out. |
+| `SEARCH_BACKEND` | Optional search provider selector: `serper` (default), `serpapi`, `exa`, `ddg`, or `parallel`. |
 | `EXA_API_KEY` | Exa.ai for neural search (fallback) and content fetching. Highly recommended. |
 | `JINA_API_KEY` | Jina Reader for fetching JavaScript-heavy or paywalled pages. Optional but improves success rates. |
 | `OPENAI_API_KEY` | OpenAI API key for rubric creation and post-processing rewrite (GPT-5.4). Only needed for those features. |
 | `ANTHROPIC_API_KEY` | Anthropic API key for alternative post-processing rewrite (Claude Opus). Optional. |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, requires setting `SEARCH_BACKEND=serpapi`). |
 | `GOOGLE_API_KEY` | Gemini API key. Only needed if you're using Gemini as the judge model. |
+
+When `SEARCH_BACKEND=parallel`, TrajectoryKit uses the [keyless, rate-limited Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) at `https://search.parallel.ai/mcp`. Search queries are sent to Parallel. Requests identify the project with the `trajectorykit/0.2.0` User-Agent for aggregate MCP usage measurement; it does not contain a user or installation identifier.
 
 #### Setting up your `.env` file
 
@@ -571,6 +574,8 @@ EXA_API_KEY=your_exa_key
 JINA_API_KEY=your_jina_key
 OPENAI_API_KEY=your_openai_key
 ANTHROPIC_API_KEY=your_anthropic_key
+# Optional: select the keyless, rate-limited Parallel Search MCP.
+# SEARCH_BACKEND=parallel
 ```
 
 The framework automatically loads these when you run `orchestrate.py` or call `dispatch()`.
@@ -617,7 +622,8 @@ The framework automatically loads these when you run `orchestrate.py` or call `d
 │  think             Reasoning scratchpad                  │
 │                                                          │
 │  WORKER TOOLS (sub-agents):                              │
-│  search_web        Serper → Exa → DuckDuckGo fallback   │
+│  search_web        Default: Serper → Exa → DuckDuckGo   │
+│                  Optional: Parallel Search MCP         │
 │  fetch_url         Direct → Jina → Exa → Wayback chain  │
 │  read_page         Paginate cached page text (no I/O)    │
 │  extract_tables    HTML tables → structured JSON         │

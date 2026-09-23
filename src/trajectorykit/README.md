@@ -11,6 +11,7 @@ This is the core Python package. For full documentation, setup instructions, and
 | `agent.py` | Agentic loop — iterative tool calling with budget management and recursive dispatch |
 | `config.py` | YAML config loader with fallback chain |
 | `tool_store.py` | Tool definitions, wrappers, and dispatch routing |
+| `parallel_mcp.py` | Optional Parallel Search MCP provider |
 | `tracing.py` | Trace dataclasses, JSON serialization, and HTML renderer |
 | `memory.py` | `MemoryStore` — compressed external storage for tool outputs |
 | `utils.py` | Shared utilities |

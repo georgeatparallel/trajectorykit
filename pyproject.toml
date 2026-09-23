@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "requests",
+    "httpx",
     "python-dotenv",
     "pyyaml",
     "duckduckgo-search>=7.0",

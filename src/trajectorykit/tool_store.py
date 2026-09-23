@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, List, Optional,Tuple, Union
 from .utils import SUPPORTED_LANGUAGES, API_TIMEOUT, MAX_RETRIES, INITIAL_RETRY_DELAY
 from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW  # noqa: F811 — re-import ensures fresh values
 from . import config as _cfg
+from .parallel_mcp import search_parallel as _run_parallel_search
 from .tracing import EpisodeTrace  # adjust import path to wherever EpisodeTrace lives
 import logging
 import os
@@ -70,13 +71,18 @@ def cleanup_sandbox() -> bool:
 DEFAULT_NUM_SEARCHES = 5
 
 # ── Search backend selection ─────────────────────────────────────────────
-# Set SEARCH_BACKEND env var to switch: "serper" (default) or "serpapi"
-# Each backend needs its own API key:
+# Set SEARCH_BACKEND env var to choose the primary search provider.
+# Configure a key for keyed backends:
 #   - serper:  SERPER_API_KEY  (from serper.dev)
 #   - serpapi: SERP_API_KEY    (from serpapi.com)
+#   - parallel: no key required (rate-limited anonymous Search MCP)
 
 SEARCH_TIMEOUT = 25   # seconds — complex quoted queries need more time
 MAX_SEARCH_RETRIES = 2
+
+
+def _search_parallel(q: str, num_results: int = 5) -> str:
+    return _run_parallel_search(q, num_results, SEARCH_TIMEOUT)
 
 
 def _search_serper(q: str, num_results: int = 5) -> str:
@@ -407,6 +413,7 @@ _SEARCH_BACKENDS = {
     "serpapi": (_search_serpapi,  [_search_exa, _search_ddg]),
     "exa":    (_search_exa,      [_search_serper, _search_ddg]),
     "ddg":    (_search_ddg,      [_search_exa, _search_serper]),
+    "parallel": (_search_parallel, [_search_exa, _search_ddg, _search_serper]),
 }
 
 
@@ -419,6 +426,7 @@ def search_web(q: str, num_results: int = 5) -> str:
       "serpapi" — Google via SerpAPI.com
       "exa"    — Exa.ai neural search
       "ddg"    — DuckDuckGo (no key required)
+      "parallel" — Parallel Search MCP (no key required; rate-limited)
 
     On failure, remaining backends are tried in order automatically.
 
@@ -3748,9 +3756,10 @@ TOOLS = [
         "function": {
             "name": "search_web",
             "description": (
-                "Search the internet using Google via SerpAPI. Returns formatted search results with titles, URLs, and snippets. "
+                "Search the web using the configured provider (Serper by default; optionally Parallel Search MCP via SEARCH_BACKEND=parallel). "
+                "Returns formatted search results with titles, URLs, and snippets, with automatic fallback on provider errors. "
                 "Use this to find current information, answer factual questions, or research topics. "
-                "Automatically handles errors like rate limits, invalid keys, and timeouts."
+                "Parallel Search MCP is keyless and rate-limited; selected queries are sent to Parallel."
             ),
             "parameters": {
                 "type": "object",
